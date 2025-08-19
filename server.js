@@ -2,7 +2,7 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const cors = require('cors');
 const { start: startScheduler } = require('./src/services/scheduler');
-const whatsappRoutes = require('./src/routes/whatsapp');
+const whatsappRoutes = require('./src/routes/whatsappRoutes');
 const { supabase } = require('./src/lib/supabase');
 
 const app = express();

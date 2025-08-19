@@ -1,108 +1,75 @@
 // src/lib/venom.js
 const venom = require('venom-bot');
-const WebSocket = require('ws');
+const { serviceRoleSupabase } = require('./supabase');
 
 // Objeto para armazenar as sessões do Venom, uma por usuário
 let venomClients = {};
 
-// Mapa para associar o ID do usuário à sua conexão WebSocket
-let userSockets = new Map();
-
-// Cria uma instância do servidor WebSocket
-const wss = new WebSocket.Server({ port: 8080 });
-
-// Lida com novas conexões WebSocket
-wss.on('connection', ws => {
-    console.log('Cliente WebSocket conectado!');
-    
-    // Quando o cliente envia uma mensagem (esperamos o userId)
-    ws.on('message', message => {
-        const data = JSON.parse(message);
-        if (data.type === 'start_session' && data.userId) {
-            console.log(`Recebido pedido para iniciar sessão para o usuário: ${data.userId}`);
-            // Adiciona o userId à conexão WebSocket
-            userSockets.set(data.userId, ws);
-            // Inicia a sessão do Venom
-            createVenomSession(data.userId);
-        }
-    });
-
-    ws.on('close', () => {
-        // Remove a conexão do mapa quando o cliente se desconecta
-        for (let [key, value] of userSockets.entries()) {
-            if (value === ws) {
-                userSockets.delete(key);
-                console.log(`Conexão WebSocket para o usuário ${key} fechada.`);
-                break;
-            }
-        }
-    });
-});
-
 /**
  * Cria ou retorna a sessão do Venom para um usuário específico.
- * Nota: Removida a dependência do supabaseClient para esta abordagem.
+ * Retorna o QR Code via promessa.
  * @param {string} userId O ID do usuário.
- * @returns {Promise<object>} O cliente Venom.
+ * @returns {Promise<object>} O QR Code como uma string, ou um erro se falhar.
  */
-const createVenomSession = async (userId) => {
-    console.log(`[Venom] Chamada para createVenomSession para o usuário: ${userId}`);
+const getQRCodeFromVenom = async (userId) => {
     // Se o cliente para este usuário já existir, retorne-o
     if (venomClients[userId]) {
-        console.log(`[Venom] Cliente para o usuário ${userId} já existe. Retornando cliente existente.`);
-        return venomClients[userId];
-    }
-    
-    console.log(`[Venom] Nenhum cliente encontrado para ${userId}. Criando nova sessão...`);
-
-    const clientSocket = userSockets.get(userId);
-    if (!clientSocket) {
-        console.error(`[Venom] Erro: Conexão WebSocket para o usuário ${userId} não encontrada.`);
-        return null;
+        console.log(`Cliente Venom para o usuário ${userId} já existe.`);
+        // Verifique o status da sessão antes de retornar
+        const status = await venomClients[userId].checkConnectionStatus();
+        if (status === 'isLogged' || status === 'qrReadSuccess') {
+            console.log(`Sessão do usuário ${userId} já está conectada. Retornando status 'connected'.`);
+            return { status: 'connected' };
+        }
     }
 
-    try {
-        const venomClient = await venom.create({
-            session: `session_${userId}`,
-            // Desativa o modo headless para ver o navegador
-            // Usa a versão do navegador que o puppeteer instala por padrão.
-            puppeteer: {},
-            // O ouvinte de estado principal
-            onStateChange: async (state) => {
-                console.log(`[Venom] Status da sessão do usuário ${userId}: ${state}`);
-                // Envia o status para o frontend via WebSocket
-                if (clientSocket.readyState === WebSocket.OPEN) {
-                    clientSocket.send(JSON.stringify({ type: 'status', status: state }));
-                }
+    // AQUI: Usamos uma promessa para esperar a criação do cliente.
+    // Os ouvintes de evento são passados diretamente na configuração.
+    return new Promise((resolve, reject) => {
+        try {
+            venom.create({
+                session: `session_${userId}`,
+                headless: 'new',
+                logQR: true,
 
-                if (state === 'connected') {
-                    console.log(`[Venom] Status: connected.`);
-                    // Nota: a lógica do Supabase foi removida daqui, pois o frontend gerencia o estado.
-                }
-            },
-            // O ouvinte de QR Code.
-            onqrCode: async (qrCodeDataUrl) => {
-                console.log(`[Venom] onqrCode acionado. Gerando QR Code para o usuário ${userId}.`);
-                // Envia o QR Code para o frontend via WebSocket
-                if (clientSocket.readyState === WebSocket.OPEN) {
-                    clientSocket.send(JSON.stringify({ type: 'qr_code', data: qrCodeDataUrl }));
-                }
-            }
-        });
+                // Ouvinte correto para QR Code
+                catchQR: (base64Qrimg, asciiQR, attempts, urlCode) => {
+                    console.log("ASCII QR:\n", asciiQR);
+                    console.log(`QR Code gerado para o usuário ${userId}. Resolvendo a promessa.`);
+                    resolve(base64Qrimg); // aqui você pode salvar o base64
+                },
 
-        venomClients[userId] = venomClient;
-        console.log(`[Venom] Cliente Venom inicializado com sucesso para o usuário ${userId}.`);
+                // Status da sessão
+                statusFind: (statusSession, session) => {
+                    console.log(`Status da sessão do usuário ${userId}: ${statusSession}`);
+                },
 
-        return venomClient;
+                // Mudanças de estado
+                onStateChange: async (state) => {
+                    console.log(`State change para ${userId}: ${state}`);
 
-    } catch (err) {
-        console.error(`[Venom] Erro ao criar sessão para o usuário ${userId}:`, err);
-        console.error(`[Venom] Causa Provável: Problema de conexão ou configuração. Por favor, verifique se não há outra sessão do WhatsApp aberta.`);
-        if (clientSocket.readyState === WebSocket.OPEN) {
-                    clientSocket.send(JSON.stringify({ type: 'error', message: err.message }));
-                }
-        throw err;
-    }
+                    if (state === 'CONNECTED') {
+                        await serviceRoleSupabase
+                            .from('whatsapp_sessions_2')
+                            .update({ status: 'connected', qr_code_data: null })
+                            .eq('user_id', userId);
+                    } else if (state === 'TIMEOUT' || state === 'FAILURE') {
+                        reject(new Error(`Erro de conexão Venom: ${state}`));
+                    }
+                },
+            }).then((client) => {
+                venomClients[userId] = client;
+                console.log(`Cliente Venom inicializado para o usuário ${userId}.`);
+            }).catch((err) => {
+                console.error(`Erro ao criar cliente Venom para o usuário ${userId}:`, err);
+                reject(err);
+            });
+        } catch (err) {
+            console.error(`Erro ao criar sessão para o usuário ${userId}:`, err);
+            reject(err);
+        }
+    });
+
 };
 
 /**
@@ -128,4 +95,4 @@ const sendWhatsAppMessage = async (userId, phoneNumber, message) => {
 };
 
 // Exporte as funções
-module.exports = { createVenomSession, getVenomClient, sendWhatsAppMessage, wss };
+module.exports = { getQRCodeFromVenom, getVenomClient, sendWhatsAppMessage };
